@@ -1300,97 +1300,6 @@ https://github.com/notional-finance/leveraged-vaults/pull/74
 
 Also includes a related fix for #80, in the changes above we do not use the token balances but owner will pass in the total amounts to re-enter the pools with manually.
 
-# Issue H-10: Weighted pool spot price calculation is incorrect 
-
-Source: https://github.com/sherlock-audit/2023-10-notional-judging/issues/111 
-
-## Found by 
-Tri-pathi
-## Summary
-Notional calculate the spot price of Weighted pool using the balances of token. Which need to be upscaled according to the balancer but Notional doesn't.
-
-## Vulnerability Detail
-Weighted pool
-
-```solidity
-File: leveraged-vaults/contracts/vaults/balancer/BalancerSpotPrice.sol
-19    function getWeightedSpotPrices(
-20      bytes32 poolId,
-21        address poolAddress,
-22        uint256 primaryIndex,
-23        uint8 primaryDecimals
-24    ) external view returns (uint256[] memory balances, uint256[] memory spotPrices) {
-25        (/* */, balances, /* */) = Deployments.BALANCER_VAULT.getPoolTokens(poolId);
-26        // Only two token pools are supported
-27        require(balances.length == 2);
-28        spotPrices = new uint256[](2);
-29
-30        uint256[] memory weights = IWeightedPool(poolAddress).getNormalizedWeights();
-31
-32        // Spot price calculation is specified at the link below. Do not account for swap fees
-33        // because we're using this price to compare to the oracle price and adding swap fees
-34       // would unnecessarily increase the price deviation.
-35        // https://docs.balancer.fi/reference/math/weighted-math.html#typescript
-36        // secondaryBalance * primaryWeight * primaryDecimals 
-37        // --------------------------------------------------- 
-38        //          primaryBalance * secondaryWeight
-39        uint256 secondaryIndex = 1 - primaryIndex;
-40
-41        // There is a chance of a uint256 overflow if the balances[secondaryIndex] > 10**36
-42        uint256 numerator = balances[secondaryIndex] * weights[primaryIndex] * (10 ** primaryDecimals);
-43        uint256 denominator = balances[primaryIndex] * weights[secondaryIndex];
-44        spotPrices[secondaryIndex] = numerator / denominator; //@audit-issue here we should have upscaled spot price (in 18 decimals)
-45    }
-```
-https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/balancer/BalancerSpotPrice.sol#L19
- - [getWeightedSpotPrices](https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/balancer/BalancerSpotPrice.sol#L19) is called to find the spot price
- - it fetches the balances and Normalized weight of token at Line 25 and 30
- - Then calculated the spot price -`Price at which first token can be exchanged for second token` without upscaling them
- - Since the pool hooks in balancer always work with upscaled balance so we need to manually upscale here for consistency [Reference](https://github.com/balancer/balancer-v2-monorepo/blob/master/pkg/pool-weighted/contracts/BaseWeightedPool.sol#L93) before calculating any params for WeighedMath
-
-while 
-```solidity
-File:pkg/pool-weighted/contracts/BaseWeightedPool.sol
-    function getInvariant() public view returns (uint256) {
-        (, uint256[] memory balances, ) = getVault().getPoolTokens(getPoolId());
-
-        // Since the Pool hooks always work with upscaled balances, we manually
-        // upscale here for consistency
-        _upscaleArray(balances, _scalingFactors()); //@audit upscale needed like this in notional
-
-        uint256[] memory normalizedWeights = _getNormalizedWeights();
-        return WeightedMath._calculateInvariant(normalizedWeights, balances);
-    }
-```
-https://github.com/balancer/balancer-v2-monorepo/blob/master/pkg/pool-weighted/contracts/BaseWeightedPool.sol#L93
-balancer recommend to upscale the balances for the consistence calculation throughout the WeightedMath
-
-Hence this return unscaled spot price which can create further integration risk when decimals of tokens aren't same and not 18.
-## Impact
-Notional returns unscaled spot price for Weighted Pool which further leads to integration and an array of issues which is dependent on the spot price of Weighted Pool
-## Code Snippet
-https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/balancer/BalancerSpotPrice.sol#L19
-https://github.com/balancer/balancer-v2-monorepo/blob/master/pkg/pool-weighted/contracts/BaseWeightedPool.sol#L93
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-return upscaled spot price in Weighted pool like the composable pool
-
-
-
-## Discussion
-
-**jeffywu**
-
-This should be a high priority issue, the spot prices would be incorrect for weighted pools with non 18 decimal tokens.
-
-**jeffywu**
-
-https://github.com/notional-finance/leveraged-vaults/pull/62
-
 # Issue M-1: No check for active L2 Sequencer 
 
 Source: https://github.com/sherlock-audit/2023-10-notional-judging/issues/2 
@@ -1472,6 +1381,26 @@ Valid, good suggestion
 **jeffywu**
 
 https://github.com/notional-finance/leveraged-vaults/pull/76
+
+**nevillehuang**
+
+Just to further avoid any potential escalations (if it helps), I am aware of the recent sherlock rule changes [here](https://docs.sherlock.xyz/audits/judging/judging#vii.-list-of-issue-categories-that-are-not-considered-valid):
+
+> 20. Chain re-org and network liveness related issues are not considered valid.
+Exception: If an issue concerns any kind of a network admin (e.g. a sequencer), can be remedied by a smart contract modification, the procol team considers external admins restricted and the considered network was explicitly mentioned in the contest README, it may be a valid medium. It should be assumed that any such network issues will be resolved within 7 days, if that may be possible.
+
+Imo, this constitutes a valid medium given considered network (Arbitrum) was explicitly mentioned in the contest README and external admins are restricted as seen below here
+
+> On what chains are the smart contracts going to be deployed?
+
+> Arbitrum, Mainnet, Optimism
+
+and here:
+
+> Are the admins of the protocols your contracts integrate with (if any) TRUSTED or RESTRICTED?
+
+> RESTRICTED, see answer to question below: "In case of external protocol integrations, are the risks of external contracts pausing or executing an emergency withdrawal acceptable?"
+> Our understanding of the external protocols is that the scope of admin functionality is restricted.
 
 # Issue M-2: reinvestReward() generates dust totalPoolClaim causing vault abnormal 
 
@@ -1650,6 +1579,47 @@ Thanks, good finding.
 
 https://github.com/notional-finance/leveraged-vaults/pull/69
 
+**gstoyanovbg**
+
+As I read the report, I left with the impression that the getActualSupply function should be used because there is some amount of pre-minted BPT tokens. However, this is not true in the case of weighted pools. In those cases, we don't have pre-minted tokens, and consequently, there is no virtual supply. This is evident from the links to the contracts provided in the description. This is the code of the getActualSupply function.
+
+```solidity
+    /**
+     * @notice Returns the effective BPT supply.
+     *
+     * @dev This would be the same as `totalSupply` however the Pool owes debt to the Protocol in the form of unminted
+     * BPT, which will be minted immediately before the next join or exit. We need to take these into account since,
+     * even if they don't yet exist, they will effectively be included in any Pool operation that involves BPT.
+     *
+     * In the vast majority of cases, this function should be used instead of `totalSupply()`.
+     *
+     * **IMPORTANT NOTE**: calling this function within a Vault context (i.e. in the middle of a join or an exit) is
+     * potentially unsafe, since the returned value is manipulable. It is up to the caller to ensure safety.
+     *
+     * This is because this function calculates the invariant, which requires the state of the pool to be in sync
+     * with the state of the Vault. That condition may not be true in the middle of a join or an exit.
+     *
+     * To call this function safely, attempt to trigger the reentrancy guard in the Vault by calling a non-reentrant
+     * function before calling `getActualSupply`. That will make the transaction revert in an unsafe context.
+     * (See `whenNotInVaultContext` in `WeightedPool`).
+     *
+     * See https://forum.balancer.fi/t/reentrancy-vulnerability-scope-expanded/4345 for reference.
+     */
+    function getActualSupply() external view returns (uint256) {
+        uint256 supply = totalSupply();
+
+        (uint256 protocolFeesToBeMinted, ) = _getPreJoinExitProtocolFees(
+            getInvariant(),
+            _getNormalizedWeights(),
+            supply
+        );
+
+        return supply.add(protocolFeesToBeMinted);
+    }
+```
+
+From the comment, it is apparent that this function should be used because the pool owes debt to the Protocol in the form of unminted BPT, which should be taken into consideration. Despite the incorrect reason, I agree that getActualSupply should be used instead of totalSupply. I'm not entirely sure about the impact, and I won't comment on it. I'm writing this comment because the report will be read by people after the contest, and they would receive incorrect information.
+
 # Issue M-4: Some curve pools can not be used as a single sided strategy 
 
 Source: https://github.com/sherlock-audit/2023-10-notional-judging/issues/40 
@@ -1688,7 +1658,470 @@ Valid suggestion.
 
 https://github.com/notional-finance/leveraged-vaults/pull/70
 
-# Issue M-5: Emergency withdraw might not be enough if the underlying pool is a nested pool 
+# Issue M-5: `depositFromNotional` function is payable, which means that it should accept Ether, but in reality will revert 100% when msg.value > 0 
+
+Source: https://github.com/sherlock-audit/2023-10-notional-judging/issues/51 
+
+## Found by 
+AuditorPraise, Vagner
+## Summary
+The function `depositFromNotional` used in `BaseStrategyVault.sol` is payable, which means that it should accept Ether, but in reality it will revert every time when msg.value is > than 0 in any of existing strategy.
+## Vulnerability Detail
+`depositFromNotional` is a function used in `BaseStrategyVault.sol` for every strategy, to deposit from notional to a specific strategy. As you can see this function has the `payable` keyword
+ https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/common/BaseStrategyVault.sol#L166-L173
+which means that it is expected to be used along with msg.value being > than 0. This function would call `_depositFromNotional` which is different on any strategy used, but let's take the most simple case, since all of them will be the same in the end, the case of `CrossCurrencyVault.sol`. In `CrossCurrencyVault.sol` , `_depositFromNotional`  would later call `_executeTrade`
+https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/CrossCurrencyVault.sol#L184 
+which would use the `TradeHandler` library as can be seen here 
+https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/common/BaseStrategyVault.sol#L124
+If we look into the `TradeHandler` library, `_executeTrade` would delegatecall into the implementation of `TradingModule.sol` to `executeTrade` function, as can be seen here 
+https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/trading/TradeHandler.sol#L41-L42
+If we look into the `executeTrade` function in `TradingModule.sol` we can see that this function does not have the payable, keyword, which mean that it will not accept msg.value >  than 0 
+https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/trading/TradingModule.sol#L169-L193
+The big and important thing to know about delegate call is that, msg.sender and msg.value will always be kept when you delegate call, so the problem that arise here is the fact that , the calls made to `depositFromNotional`  with msg.value > 0 , would always revert when it gets to this delegatecall, in every strategy, since the function that it delegates to , doesn't have the `payable` keyword, and since msg.value is always kept trough the delegate calls, the call would just revert. This would be the case for all the strategies since they all uses `_executeTrade` or `_executeTradeWithDynamicSlippage` in a way or another, so every payable function that would use any of these 2 functions from the `TradeHandler.sol` library would revert all the time, if msg.value is > 0.
+## Impact
+Impact is a high one, since strategy using pools that need to interact with Ether would be useless and the whole functionality would be broken.
+## Code Snippet
+https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/trading/TradeHandler.sol#L18-L45
+## Tool used
+
+Manual Review
+
+## Recommendation
+There are multiple solution to this, the easiest one is to make the function `executeTrade` in `TradingModule.sol` payable, so the delegate call would not revert when msg.value is greater than 0, or if you don't intend to use ether with `depositFromNotional`, remove the `payable` keyword. It is important to take special care in those delegate calls since they are used multiple times in the codebase, and could mess up functionalities when msg.value is intended to be used.
+
+
+
+## Discussion
+
+**jeffywu**
+
+Trade Handler is executed in a delegate call context, I don't really follow this issue.
+
+**VagnerAndrei26**
+
+Escalate
+I want to escalate this issue and explain it a bit better so it can be understood. The core of this issue stands at the base of how `delegatecall` works. The big difference between normal `call` and `delegatecall` is , as I said , `msg.sender` and `msg.value` are kept within the call. Here is the source code of EVM 
+```solidity
+File: core\vm\contract.go
+134: func (c *Contract) AsDelegate() *Contract {
+135: 	// NOTE: caller must, at all times be a contract. It should never happen
+136: 	// that caller is something other than a Contract.
+137: 	parent := c.caller.(*Contract)
+138: 	c.CallerAddress = parent.CallerAddress
+139: 	c.value = parent.value
+140: 
+141: 	return c
+142: }
+```
+basically what this means is that, anytime when you have a function that is payable, and implicitly has `msg.value` > 0 , that `msg.value` will always be passed in a `delegatecall`. In the case of normal `call` you can choose if you want to pass some value by using `{ value: }`, after calling the function in a contract, but for `delegatecall` you can't choose, so what will happen is that, any time you do a `delegatecall` inside a function that has payable and where `msg.value` is > 0, that value is always passed in that `delegatecall` and if the function called does not have the `payable` keyword, the transaction will always revert, the same as when you are trying to do a simple `call` to a contract without having a `receive` function or `payable` keyword on a function. So in our case, because `_executeTrade ` or `_executeTradeWithDynamicSlippage ` does not have the `payable` keyword, any call on `depositFromNotional ` with `msg.value` > 0 , would revert all the time, making the vaults in the cases where ETH is used useless.
+Also issue #8 is not a duplicate of this, since it would fall more to this duplicate rule of sherlock which states 
+![image](https://github.com/sherlock-audit/2023-10-notional-judging/assets/111457602/b4e57106-6bf7-4fd1-9669-0ccf1b6b6d5c)
+since the report identifies the core issue, which is lacking the `payable` keyword but doesn't correctly identifies the reason behind that being an issue or the impact.
+
+**sherlock-admin2**
+
+ > Escalate
+> I want to escalate this issue and explain it a bit better so it can be understood. The core of this issue stands at the base of how `delegatecall` works. The big difference between normal `call` and `delegatecall` is , as I said , `msg.sender` and `msg.value` are kept within the call. Here is the source code of EVM 
+> ```solidity
+> File: core\vm\contract.go
+> 134: func (c *Contract) AsDelegate() *Contract {
+> 135: 	// NOTE: caller must, at all times be a contract. It should never happen
+> 136: 	// that caller is something other than a Contract.
+> 137: 	parent := c.caller.(*Contract)
+> 138: 	c.CallerAddress = parent.CallerAddress
+> 139: 	c.value = parent.value
+> 140: 
+> 141: 	return c
+> 142: }
+> ```
+> basically what this means is that, anytime when you have a function that is payable, and implicitly has `msg.value` > 0 , that `msg.value` will always be passed in a `delegatecall`. In the case of normal `call` you can choose if you want to pass some value by using `{ value: }`, after calling the function in a contract, but for `delegatecall` you can't choose, so what will happen is that, any time you do a `delegatecall` inside a function that has payable and where `msg.value` is > 0, that value is always passed in that `delegatecall` and if the function called does not have the `payable` keyword, the transaction will always revert, the same as when you are trying to do a simple `call` to a contract without having a `receive` function or `payable` keyword on a function. So in our case, because `_executeTrade ` or `_executeTradeWithDynamicSlippage ` does not have the `payable` keyword, any call on `depositFromNotional ` with `msg.value` > 0 , would revert all the time, making the vaults in the cases where ETH is used useless.
+> Also issue #8 is not a duplicate of this, since it would fall more to this duplicate rule of sherlock which states 
+> ![image](https://github.com/sherlock-audit/2023-10-notional-judging/assets/111457602/b4e57106-6bf7-4fd1-9669-0ccf1b6b6d5c)
+> since the report identifies the core issue, which is lacking the `payable` keyword but doesn't correctly identifies the reason behind that being an issue or the impact.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**AuditorPraise**
+
+> Escalate I want to escalate this issue and explain it a bit better so it can be understood. The core of this issue stands at the base of how `delegatecall` works. The big difference between normal `call` and `delegatecall` is , as I said , `msg.sender` and `msg.value` are kept within the call. Here is the source code of EVM
+> 
+> ```solidity
+> File: core\vm\contract.go
+> 134: func (c *Contract) AsDelegate() *Contract {
+> 135: 	// NOTE: caller must, at all times be a contract. It should never happen
+> 136: 	// that caller is something other than a Contract.
+> 137: 	parent := c.caller.(*Contract)
+> 138: 	c.CallerAddress = parent.CallerAddress
+> 139: 	c.value = parent.value
+> 140: 
+> 141: 	return c
+> 142: }
+> ```
+> 
+> basically what this means is that, anytime when you have a function that is payable, and implicitly has `msg.value` > 0 , that `msg.value` will always be passed in a `delegatecall`. In the case of normal `call` you can choose if you want to pass some value by using `{ value: }`, after calling the function in a contract, but for `delegatecall` you can't choose, so what will happen is that, any time you do a `delegatecall` inside a function that has payable and where `msg.value` is > 0, that value is always passed in that `delegatecall` and if the function called does not have the `payable` keyword, the transaction will always revert, the same as when you are trying to do a simple `call` to a contract without having a `receive` function or `payable` keyword on a function. So in our case, because `_executeTrade ` or `_executeTradeWithDynamicSlippage ` does not have the `payable` keyword, any call on `depositFromNotional ` with `msg.value` > 0 , would revert all the time, making the vaults in the cases where ETH is used useless. Also issue #8 is not a duplicate of this, since it would fall more to this duplicate rule of sherlock which states ![image](https://private-user-images.githubusercontent.com/111457602/287818052-b4e57106-6bf7-4fd1-9669-0ccf1b6b6d5c.png?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTEiLCJleHAiOjE3MDE3OTk0NTQsIm5iZiI6MTcwMTc5OTE1NCwicGF0aCI6Ii8xMTE0NTc2MDIvMjg3ODE4MDUyLWI0ZTU3MTA2LTZiZjctNGZkMS05NjY5LTBjY2YxYjZiNmQ1Yy5wbmc_WC1BbXotQWxnb3JpdGhtPUFXUzQtSE1BQy1TSEEyNTYmWC1BbXotQ3JlZGVudGlhbD1BS0lBSVdOSllBWDRDU1ZFSDUzQSUyRjIwMjMxMjA1JTJGdXMtZWFzdC0xJTJGczMlMkZhd3M0X3JlcXVlc3QmWC1BbXotRGF0ZT0yMDIzMTIwNVQxNzU5MTRaJlgtQW16LUV4cGlyZXM9MzAwJlgtQW16LVNpZ25hdHVyZT04NzkwMDRhNGJjMjEwZDhiMDMyY2I0NTIwYjJhZjE0YWVjNWIwMjJkN2RkMTAwYjkwZWNmOGEyYTI4MDUzNDJjJlgtQW16LVNpZ25lZEhlYWRlcnM9aG9zdCZhY3Rvcl9pZD0wJmtleV9pZD0wJnJlcG9faWQ9MCJ9.PBnCsygUXOuIu1feHTc1KAik9tM5Dhu6c_Uhnd5fuck) since the report identifies the core issue, which is lacking the `payable` keyword but doesn't correctly identifies the reason behind that being an issue or the impact.
+
+LoL, how is #8  a low? Because i didn't use the same exact words you used when describing your issue? 
+#8  's  summary: The vaults will be executing trades on external exchanges via TradingModule.executeTrade() and TradingModule.executeTradeWithDynamicSlippage() and ETH could be among the tokens to trade for primary token BUT the tradingModule.executeTrade() and TradingModule.executeTradeWithDynamicSlippage() lack the payable keyword.
+
+Its vulnerability detail: tradingModule.executeTrade() and TradingModule.executeTradeWithDynamicSlippage() won't be able to receive ETH (Whenever ETH is sell token) because they lack the payable keyword.
+
+This can cause reverts in some of the key functions of the vaults like:
+
+depositFromNotional()
+redeemFromNotional()
+reinvestReward()
+
+
+And its impact:  vaults will be unable to execute trades on external exchanges via the trading module whenever ETH is the sell Token`
+
+How are they different?
+#8  's impact is clearly described and i don't see how it's different from your described impact because they're both implying the same thing
+Anyways thanks for escalating sir
+
+**VagnerAndrei26**
+
+> > Escalate I want to escalate this issue and explain it a bit better so it can be understood. The core of this issue stands at the base of how `delegatecall` works. The big difference between normal `call` and `delegatecall` is , as I said , `msg.sender` and `msg.value` are kept within the call. Here is the source code of EVM
+> > ```solidity
+> > File: core\vm\contract.go
+> > 134: func (c *Contract) AsDelegate() *Contract {
+> > 135: 	// NOTE: caller must, at all times be a contract. It should never happen
+> > 136: 	// that caller is something other than a Contract.
+> > 137: 	parent := c.caller.(*Contract)
+> > 138: 	c.CallerAddress = parent.CallerAddress
+> > 139: 	c.value = parent.value
+> > 140: 
+> > 141: 	return c
+> > 142: }
+> > ```
+> > 
+> > 
+> >     
+> >       
+> >     
+> > 
+> >       
+> >     
+> > 
+> >     
+> >   
+> > basically what this means is that, anytime when you have a function that is payable, and implicitly has `msg.value` > 0 , that `msg.value` will always be passed in a `delegatecall`. In the case of normal `call` you can choose if you want to pass some value by using `{ value: }`, after calling the function in a contract, but for `delegatecall` you can't choose, so what will happen is that, any time you do a `delegatecall` inside a function that has payable and where `msg.value` is > 0, that value is always passed in that `delegatecall` and if the function called does not have the `payable` keyword, the transaction will always revert, the same as when you are trying to do a simple `call` to a contract without having a `receive` function or `payable` keyword on a function. So in our case, because `_executeTrade ` or `_executeTradeWithDynamicSlippage ` does not have the `payable` keyword, any call on `depositFromNotional ` with `msg.value` > 0 , would revert all the time, making the vaults in the cases where ETH is used useless. Also issue #8 is not a duplicate of this, since it would fall more to this duplicate rule of sherlock which states ![image](https://private-user-images.githubusercontent.com/111457602/287818052-b4e57106-6bf7-4fd1-9669-0ccf1b6b6d5c.png?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTEiLCJleHAiOjE3MDE3OTk0NTQsIm5iZiI6MTcwMTc5OTE1NCwicGF0aCI6Ii8xMTE0NTc2MDIvMjg3ODE4MDUyLWI0ZTU3MTA2LTZiZjctNGZkMS05NjY5LTBjY2YxYjZiNmQ1Yy5wbmc_WC1BbXotQWxnb3JpdGhtPUFXUzQtSE1BQy1TSEEyNTYmWC1BbXotQ3JlZGVudGlhbD1BS0lBSVdOSllBWDRDU1ZFSDUzQSUyRjIwMjMxMjA1JTJGdXMtZWFzdC0xJTJGczMlMkZhd3M0X3JlcXVlc3QmWC1BbXotRGF0ZT0yMDIzMTIwNVQxNzU5MTRaJlgtQW16LUV4cGlyZXM9MzAwJlgtQW16LVNpZ25hdHVyZT04NzkwMDRhNGJjMjEwZDhiMDMyY2I0NTIwYjJhZjE0YWVjNWIwMjJkN2RkMTAwYjkwZWNmOGEyYTI4MDUzNDJjJlgtQW16LVNpZ25lZEhlYWRlcnM9aG9zdCZhY3Rvcl9pZD0wJmtleV9pZD0wJnJlcG9faWQ9MCJ9.PBnCsygUXOuIu1feHTc1KAik9tM5Dhu6c_Uhnd5fuck) since the report identifies the core issue, which is lacking the `payable` keyword but doesn't correctly identifies the reason behind that being an issue or the impact.
+> 
+> LoL, how is #6 a low? Because i didn't use the same exact words you used when describing your issue? #6 's summary: The vaults will be executing trades on external exchanges via TradingModule.executeTrade() and TradingModule.executeTradeWithDynamicSlippage() and ETH could be among the tokens to trade for primary token BUT the tradingModule.executeTrade() and TradingModule.executeTradeWithDynamicSlippage() lack the payable keyword.
+> 
+> Its vulnerability detail: tradingModule.executeTrade() and TradingModule.executeTradeWithDynamicSlippage() won't be able to receive ETH (Whenever ETH is sell token) because they lack the payable keyword.
+> 
+> This can cause reverts in some of the key functions of the vaults like:
+> 
+> depositFromNotional() redeemFromNotional() reinvestReward()
+> 
+> And its impact: vaults will be unable to execute trades on external exchanges via the trading module whenever ETH is the sell Token`
+> 
+> How are they different? #6 's impact is clearly described and i don't see how it's different from your described impact because they're both implying the same thing Anyways thanks for escalating sir
+
+Hey, I didn't say that it was a low personally, I said that it is not a duplicate of this, and should be considered as the duplicate rule stated, if it is kept as a duplicate. The big difference is that the report failed to find the real problem of this whole issue, the `delegatecall`. The main important aspect of this issue is the fact that those functions, that were also specified #8, are used in a `delegatecall` and not in a normal call, if it were done in a normal call, this would have not be a problem since you can select if you want to transfer `msg.value` with the call or not. Also the report speaks about  `redeemFromNotional` and `reinvestReward` having the same issue, but that is not correct since they are not payable, so no `msg.value` is expected to be used when calling those, the only real function affected by this issue is `depositFromNotional`. Also in the report it is also talking about `TradingModule` not being able to receive ether which is not a problem again, since the main usage of `TradingModule` is to be used more as an implementation, where calls could be delegated to. That's the reasons behind my arguments, the only thing which the report accurate is the fact the those function lacks the `payable` keyword, but fails to explain the real problem behind, or why is that a problem in the current code.
+
+**AuditorPraise**
+
+> > > Escalate I want to escalate this issue and explain it a bit better so it can be understood. The core of this issue stands at the base of how `delegatecall` works. The big difference between normal `call` and `delegatecall` is , as I said , `msg.sender` and `msg.value` are kept within the call. Here is the source code of EVM
+> > > ```solidity
+> > > File: core\vm\contract.go
+> > > 134: func (c *Contract) AsDelegate() *Contract {
+> > > 135: 	// NOTE: caller must, at all times be a contract. It should never happen
+> > > 136: 	// that caller is something other than a Contract.
+> > > 137: 	parent := c.caller.(*Contract)
+> > > 138: 	c.CallerAddress = parent.CallerAddress
+> > > 139: 	c.value = parent.value
+> > > 140: 
+> > > 141: 	return c
+> > > 142: }
+> > > ```
+> > > 
+> > > 
+> > >     
+> > >       
+> > >     
+> > > 
+> > >       
+> > >     
+> > > 
+> > >     
+> > >   
+> > > basically what this means is that, anytime when you have a function that is payable, and implicitly has `msg.value` > 0 , that `msg.value` will always be passed in a `delegatecall`. In the case of normal `call` you can choose if you want to pass some value by using `{ value: }`, after calling the function in a contract, but for `delegatecall` you can't choose, so what will happen is that, any time you do a `delegatecall` inside a function that has payable and where `msg.value` is > 0, that value is always passed in that `delegatecall` and if the function called does not have the `payable` keyword, the transaction will always revert, the same as when you are trying to do a simple `call` to a contract without having a `receive` function or `payable` keyword on a function. So in our case, because `_executeTrade ` or `_executeTradeWithDynamicSlippage ` does not have the `payable` keyword, any call on `depositFromNotional ` with `msg.value` > 0 , would revert all the time, making the vaults in the cases where ETH is used useless. Also issue #8 is not a duplicate of this, since it would fall more to this duplicate rule of sherlock which states ![image](https://private-user-images.githubusercontent.com/111457602/287818052-b4e57106-6bf7-4fd1-9669-0ccf1b6b6d5c.png?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTEiLCJleHAiOjE3MDE3OTk0NTQsIm5iZiI6MTcwMTc5OTE1NCwicGF0aCI6Ii8xMTE0NTc2MDIvMjg3ODE4MDUyLWI0ZTU3MTA2LTZiZjctNGZkMS05NjY5LTBjY2YxYjZiNmQ1Yy5wbmc_WC1BbXotQWxnb3JpdGhtPUFXUzQtSE1BQy1TSEEyNTYmWC1BbXotQ3JlZGVudGlhbD1BS0lBSVdOSllBWDRDU1ZFSDUzQSUyRjIwMjMxMjA1JTJGdXMtZWFzdC0xJTJGczMlMkZhd3M0X3JlcXVlc3QmWC1BbXotRGF0ZT0yMDIzMTIwNVQxNzU5MTRaJlgtQW16LUV4cGlyZXM9MzAwJlgtQW16LVNpZ25hdHVyZT04NzkwMDRhNGJjMjEwZDhiMDMyY2I0NTIwYjJhZjE0YWVjNWIwMjJkN2RkMTAwYjkwZWNmOGEyYTI4MDUzNDJjJlgtQW16LVNpZ25lZEhlYWRlcnM9aG9zdCZhY3Rvcl9pZD0wJmtleV9pZD0wJnJlcG9faWQ9MCJ9.PBnCsygUXOuIu1feHTc1KAik9tM5Dhu6c_Uhnd5fuck) since the report identifies the core issue, which is lacking the `payable` keyword but doesn't correctly identifies the reason behind that being an issue or the impact.
+> > 
+> > 
+> > LoL, how is #6 a low? Because i didn't use the same exact words you used when describing your issue? #6 's summary: The vaults will be executing trades on external exchanges via TradingModule.executeTrade() and TradingModule.executeTradeWithDynamicSlippage() and ETH could be among the tokens to trade for primary token BUT the tradingModule.executeTrade() and TradingModule.executeTradeWithDynamicSlippage() lack the payable keyword.
+> > Its vulnerability detail: tradingModule.executeTrade() and TradingModule.executeTradeWithDynamicSlippage() won't be able to receive ETH (Whenever ETH is sell token) because they lack the payable keyword.
+> > This can cause reverts in some of the key functions of the vaults like:
+> > depositFromNotional() redeemFromNotional() reinvestReward()
+> > And its impact: vaults will be unable to execute trades on external exchanges via the trading module whenever ETH is the sell Token`
+> > How are they different? #6 's impact is clearly described and i don't see how it's different from your described impact because they're both implying the same thing Anyways thanks for escalating sir
+> 
+> Hey, I didn't say that it was a low personally, I said that it is not a duplicate of this, and should be considered as the duplicate rule stated, if it is kept as a duplicate. The big difference is that the report failed to find the real problem of this whole issue, the `delegatecall`. The main important aspect of this issue is the fact that those functions, that were also specified #8, are used in a `delegatecall` and not in a normal call, if it were done in a normal call, this would have not be a problem since you can select if you want to transfer `msg.value` with the call or not. Also the report speaks about `redeemFromNotional` and `reinvestReward` having the same issue, but that is not correct since they are not payable, so no `msg.value` is expected to be used when calling those, the only real function affected by this issue is `depositFromNotional`. Also in the report it is also talking about `TradingModule` not being able to receive ether which is not a problem again, since the main usage of `TradingModule` is to be used more as an implementation, where calls could be delegated to. That's the reasons behind my arguments, the only thing which the report accurate is the fact the those function lacks the `payable` keyword, but fails to explain the real problem behind, or why is that a problem in the current code.
+
+The `delegateCall` is not the main issue bro. The lack of a payable keyword on the tradingModule.executeTrade() and TradingModule.executeTradeWithDynamicSlippage() is the main issue. 
+Because pools that need to interact with Ether would be useless due to the missing `payable` keyword on those external functions that are supposed to interact with ETH(i.e,  tradingModule.executeTrade() and TradingModule.executeTradeWithDynamicSlippage()) and the whole functionality would be broken.
+
+Msg.value will always be > 0 whenever the token being transferred is ETH
+
+**nevillehuang**
+
+Hi @VagnerAndrei26 @AuditorPraise can any of you provide me a coded test file proving the issue? Imo if it is 100% going to revert, should be easy enough to proof it, appreciate your assistance. 
+
+**VagnerAndrei26**
+
+> Hi @VagnerAndrei26 @AuditorPraise can any of you provide me a coded test file proving the issue? Imo if it is 100% going to revert, should be easy enough to proof it, appreciate your assistance.
+
+Yeah I can, I can show a simpler implementation of 2 contracts doing some delegatecalls, I am 100% sure on this issue, because I got paid for it multiple times already and it got confirmed in other contest too. Will provide the simple example later today, after I get home.
+
+**AuditorPraise**
+
+Hello bro @nevillehuang, i just wrote a quick implementation of 2 contracts doing some delegatecalls on remix.
+just copy and paste on remix 
+```solidity
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity =0.8.18;
+
+/**
+ * @hypothesis
+ * @dev just for research.
+ */
+import "hardhat/console.sol";
+
+contract ContractA {
+    receive() external payable {}
+    address public contractBAddress;
+
+    event EtherTransferred(address indexed from, address indexed to, uint256 amount);
+
+    constructor(address _contractBAddress) {
+        contractBAddress = _contractBAddress;
+    }
+
+    function delegateCallToContractB(uint256 amount) payable external {
+        // Use delegatecall to execute the transferEther function in ContractB
+        (bool success, ) = payable(contractBAddress).delegatecall(
+            abi.encodeWithSignature("transferEther(address,uint256)", msg.sender, amount)
+        );
+
+        require(success, "Delegate call to ContractB failed");
+
+        console.log("trf was successful");
+    }
+}
+
+contract ContractB {
+    receive() external payable {}
+
+    function transferEther(address recipient, uint256 amount) 
+    external {
+        //@audit-issue the delegate call from contract A fails without the payable keyword here
+
+       
+    }
+}
+```
+So this is supposed to show the issue we are talking about.
+when contractB.transferEther()'s function has the `payable` keyword the delegate call from contract A succeeds BUT when its not there it reverts.
+
+The code above should revert, then add the `payable` keyword to contractB.transferEther() you'll see that contractA.delegateCallToContractB() succeeds.
+
+Here's an article that may be of help with sending Ether on remix [How do you send Ether as a function to a contract using Remix?](https://ethereum.stackexchange.com/questions/46107/how-do-you-send-ether-as-a-function-to-a-contract-using-remix)
+
+**shealtielanz**
+
+The 2 reports are duplicates IMO, as the root issues is stated in both of them, and their mitigations solves the issues well.
+
+**nevillehuang**
+
+@jeffywu Is there a foundry test revolving this issue that shows it will not revert if u pass in a msg.value? I am really surprised if this is true that a test would not have caught this.
+
+Since the PoC provided is not protocol specific, I will have to double check before making any final comment.
+
+**VagnerAndrei26**
+
+> @jeffywu Is there a foundry test revolving this issue that shows it will not revert if u pass in a msg.value? I am really surprised if this is true that a test would not have caught this.
+> 
+> Since the PoC provided is not protocol specific, I will have to double check before making any final comment.
+
+The example provided from @AuditorPraise is good, it is pretty similar to what I wanted to present. The bases of this issue is simple, if you have a `delegatecall` inside a `payable` function, the function which you `delegatecall` to needs to have payable also, otherwise it reverts anytime when `msg.value` > 0.
+
+**Czar102**
+
+Awaiting a protocol-specific PoC @VagnerAndrei26 and a comment from @jeffywu.
+
+**VagnerAndrei26**
+
+> Awaiting a protocol-specific PoC @VagnerAndrei26 and a comment from @jeffywu.
+
+Hey @Czar102 it was kinda hard to do it, because of the complex codebase and test, but here is the protocol specific POC.
+What I did was modifying this specific test https://github.com/sherlock-audit/2023-10-notional-VagnerAndrei26/blob/ebaf16143f4d71d84affb69258bcf00c375628d3/leveraged-vaults/tests/BaseAcceptanceTest.sol#L173-L190
+by setting the `isETH` to true firstly, and giving the ETH to the `NOTIONAL` address instead of the `vault` itself. After that I was calling the `depositFromNotional` with a specific value, which reverts all the time when it gets to `executeTrade`.  The modifications would look like this
+```solidity
+    function enterVaultBypass(
+        address account,
+        uint256 depositAmount,
+        uint256 maturity,
+        bytes memory data
+    ) internal virtual returns (uint256 vaultShares) {
+        vm.prank(address(NOTIONAL));
+        deal(address(NOTIONAL), depositAmount);
+        vaultShares = vault.depositFromNotional{value : depositAmount}(account, depositAmount, maturity, data);
+        totalVaultShares[maturity] += vaultShares;
+        totalVaultSharesAllMaturities += vaultShares;
+    }
+```
+and here is the trace logs, as you can see it revert at executeTrade, as I expected and explained in the report
+```
+Running 1 test for tests/CrossCurrency/testCrossCurrencyVault.t.sol:TestCrossCurrency_ETH_WSTETH
+[FAIL. Reason: TradeFailed(); counterexample: calldata=0xde6f757a00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 args=[0, 0]] test_EnterVault(uint256,uint256) (runs: 0, μ: 0, ~: 0)
+Logs:
+  Bound Result 0
+  Bound Result 1000000000000000
+
+Traces:
+  [66058] TestCrossCurrency_ETH_WSTETH::test_EnterVault(0, 0)
+    ├─ [0] VM::addr(97821013814920132828181473597319662187411378784436296118592727588725089953873 [9.782e76]) [staticcall]
+    │   └─ ← account: [0x359e534d4C79745c3c0A0BC80d80cfAe9e82699e]
+    ├─ [0] VM::label(account: [0x359e534d4C79745c3c0A0BC80d80cfAe9e82699e], "account")
+    │   └─ ← ()
+    ├─ [0] console::log("Bound Result", 0) [staticcall]
+    │   └─ ← ()
+    ├─ [0] console::log("Bound Result", 1000000000000000 [1e15]) [staticcall]
+    │   └─ ← ()
+    ├─ [0] VM::prank(0x1344A36A1B56144C3Bc62E7757377D288fDE0369)
+    │   └─ ← ()
+    ├─ [0] VM::deal(0x1344A36A1B56144C3Bc62E7757377D288fDE0369, 1000000000000000 [1e15])
+    │   └─ ← ()
+    ├─ [26272] nBeaconProxy::depositFromNotional{value: 1000000000000000}(account: [0x359e534d4C79745c3c0A0BC80d80cfAe9e82699e], 1000000000000000 [1e15], 1099511627775 [1.099e12], 0x0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000200000000000000000000000006eb2dc694eb516b16dc9fbc678c60052bbdd7d80)
+    │   ├─ [2308] nUpgradeableBeacon::implementation() [staticcall]
+    │   │   └─ ← CrossCurrencyVault: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]
+    │   ├─ [16104] CrossCurrencyVault::depositFromNotional(account: [0x359e534d4C79745c3c0A0BC80d80cfAe9e82699e], 1000000000000000 [1e15], 1099511627775 [1.099e12], 0x0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000200000000000000000000000006eb2dc694eb516b16dc9fbc678c60052bbdd7d80) [delegatecall]
+    │   │   ├─ [2335] 0xBf6B9c5608D520469d8c4BD1E24F850497AF0Bb8::getImplementation() [staticcall]
+    │   │   │   └─ ← 0x0000000000000000000000002de2b1eecf5bab0add9147ebbb999395238d30a5
+    │   │   ├─ [213] 0x2De2B1Eecf5bab0adD9147ebBb999395238d30a5::executeTrade(7, (0, 0x0000000000000000000000000000000000000000, 0x5979D7b546E38E414F7E9822514be443A4800529, 1000000000000000 [1e15], 0, 1699104713 [1.699e9], 0x0000000000000000000000006eb2dc694eb516b16dc9fbc678c60052bbdd7d80)) [delegatecall]
+    │   │   │   └─ ← EvmError: Revert
+    │   │   └─ ← TradeFailed()
+    │   └─ ← TradeFailed()
+    └─ ← TradeFailed()
+
+Test result: FAILED. 0 passed; 1 failed; 0 skipped; finished in 712.96ms
+
+Ran 1 test suites: 0 tests passed, 1 failed, 0 skipped (1 total tests)
+
+Failing tests:
+Encountered 1 failing test in tests/CrossCurrency/testCrossCurrencyVault.t.sol:TestCrossCurrency_ETH_WSTETH
+[FAIL. Reason: TradeFailed(); counterexample: calldata=0xde6f757a00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 args=[0, 0]] test_EnterVault(uint256,uint256) (runs: 0, μ: 0, ~: 0)
+
+Encountered a total of 1 failing tests, 0 tests succeeded
+```
+
+and here is the case where the ETH is transferred to the vault itself, and then `depositFromNotional` is called 
+```solidity
+    function enterVaultBypass(
+        address account,
+        uint256 depositAmount,
+        uint256 maturity,
+        bytes memory data
+    ) internal virtual returns (uint256 vaultShares) {
+        vm.prank(address(NOTIONAL));
+        deal(address(vault), depositAmount);
+        vaultShares = vault.depositFromNotional(account, depositAmount, maturity, data);
+        totalVaultShares[maturity] += vaultShares;
+        totalVaultSharesAllMaturities += vaultShares;
+    }
+```
+and here is the trace call, where the call succeded 
+```
+Running 1 test for tests/CrossCurrency/testCrossCurrencyVault.t.sol:TestCrossCurrency_ETH_WSTETH
+[PASS] test_EnterVault(uint256,uint256) (runs: 256, μ: 843050, ~: 982549)
+Test result: ok. 1 passed; 0 failed; 0 skipped; finished in 1.51s
+
+Ran 1 test suites: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+```
+The reason that they didn't find that in the test case is because they were doing the tests in the second way, by transferring the ETH to the Vault with `deal` instead setting a `value` to the call itself, that would be the correct way to test a `payable` function.
+
+**Czar102**
+
+Interesting, thank you @VagnerAndrei26.
+
+What is the loss of funds in this scenario?
+
+**VagnerAndrei26**
+
+> Interesting, thank you @VagnerAndrei26.
+> 
+> What is the loss of funds in this scenario?
+
+This does not fall under loss of funds here, but more towards the contract rendered useless, since the main functionality, the deposit one, would not work, especially for the pools that have ETH, like the one I provided in the test file. 
+
+**jeffywu**
+
+@VagnerAndrei26 appreciate the follow up on this issue, I agree it is indeed valid. Good find. I was able to reproduce this below and put a fix in:
+https://github.com/notional-finance/leveraged-vaults/pull/80
+
+**Czar102**
+
+> The reason that they didn't find that in the test case is because they were doing the tests in the second way, by transferring the ETH to the Vault with deal instead setting a value to the call itself, that would be the correct way to test a payable function.
+
+It seems to me that the same is possible using another way. Also, there is no loss of funds, only loss of functionality. This is a really good find, but per Sherlock rules, I don't think I can make it a medium. Planning to leave it a low severity issue. Appreciate the escalation.
+
+**nevillehuang**
+
+Hi @Czar102 based on this comment by @VagnerAndrei26 I think this qualifies for a medium on grounds on a permanent DoS on a desired functionality no?
+
+> This does not fall under loss of funds here, but more towards the contract rendered useless, since the main functionality, the deposit one, would not work, especially for the pools that have ETH, like the one I provided in the test file.
+
+What is the possible other way you are referring to?
+
+**VagnerAndrei26**
+
+> > The reason that they didn't find that in the test case is because they were doing the tests in the second way, by transferring the ETH to the Vault with deal instead setting a value to the call itself, that would be the correct way to test a payable function.
+> 
+> It seems to me that the same is possible using another way. Also, there is no loss of funds, only loss of functionality. This is a really good find, but per Sherlock rules, I don't think I can make it a medium. Planning to leave it a low severity issue. Appreciate the escalation.
+
+Hey @Czar102 , there is not really other ways of doing it. The only way of doing it is passing `msg.value` since it is a function that can only be called from Notional main contract, not by users anytime. They were doing the test in other ways which was not correct, but they fixed the tests also with the fix provided above. Also most of the time, when a contract is rendered useless because of an important functionality, it was considered a medium most of the time on sherlock since it can be based on this rule
+![image](https://github.com/sherlock-audit/2023-10-notional-judging/assets/111457602/40bd0748-a010-4422-9d6f-ef86895ea1a3)
+since the protocol needs to redeploys most of the contract that were rendered useless. Also it was clearly their intention of working with those pools, and interacting with ether, but because of an important bug it is not working. Personally I can't consider it fair for this to be low/informational, since rendering a contract useless and forcing a redeployments with increased costs to the protocol is not something that should be considered low.
+Here is one example of a recent contest where, because of an issue inside, the contract was rendering it useless to work with multiple important pools from Curve, which is a similar issue with this one
+https://github.com/sherlock-audit/2023-07-blueberry-judging/issues/105
+
+**AuditorPraise**
+
+> > The reason that they didn't find that in the test case is because they were doing the tests in the second way, by transferring the ETH to the Vault with deal instead setting a value to the call itself, that would be the correct way to test a payable function.
+> 
+> It seems to me that the same is possible using another way. Also, there is no loss of funds, only loss of functionality. This is a really good find, but per Sherlock rules, I don't think I can make it a medium. Planning to leave it a low severity issue. Appreciate the escalation.
+
+Hello boss @Czar102, 
+
+There's no other way to send ETH other than having msg.value > 0. IMO i think this qualifies as a MED due to permanent Dos on a desired functionality.
+
+**Czar102**
+
+Hi, that's right, sorry for my misunderstanding and the confusion because of it. I see how the test didn't fully check the functionality. It's a great find.
+I think it's a valid medium based on the fact that core functionality is not working at all.
+
+Planning to accept the escalation and make the issue a valid medium.
+
+**Czar102**
+
+Result:
+Medium
+Has duplicates
+
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [VagnerAndrei26](https://github.com/sherlock-audit/2023-10-notional-judging/issues/51/#issuecomment-1838888111): accepted
+
+# Issue M-6: Emergency withdraw might not be enough if the underlying pool is a nested pool 
 
 Source: https://github.com/sherlock-audit/2023-10-notional-judging/issues/52 
 
@@ -1723,225 +2156,7 @@ This is a fair point.
 Fix here is to add a check to ensure that nested pools are not included:
 https://github.com/notional-finance/leveraged-vaults/pull/72
 
-# Issue M-6: Maximum number of tokens supported is incorrect 
-
-Source: https://github.com/sherlock-audit/2023-10-notional-judging/issues/70 
-
-## Found by 
-xiaoming90
-## Summary
-
-Notional is unable to deploy the new leverage vault for a Composable Pool that has 5 stable tokens, rendering the protocol useless for such types of pools.
-
-## Vulnerability Detail
-
-The following code taken from Balancer's composable pool shows that a composable pool can support up to 6 tokens (5 stable tokens + 1 BPT)
-
-https://github.com/balancer/balancer-v2-monorepo/blob/c7d4abbea39834e7778f9ff7999aaceb4e8aa048/pkg/pool-stable/contracts/ComposableStablePoolStorage.sol#L206
-
-```solidity
-File: ComposableStablePoolStorage.sol
-204:     function _getMaxTokens() internal pure override returns (uint256) {
-205:         // The BPT will be one of the Pool tokens, but it is unaffected by the Stable 5 token limit.
-206:         return StableMath._MAX_STABLE_TOKENS + 1;
-207:     }
-```
-
-https://github.com/balancer/balancer-v2-monorepo/blob/c7d4abbea39834e7778f9ff7999aaceb4e8aa048/pkg/pool-stable/contracts/StableMath.sol#L32
-
-```solidity
-File: StableMath.sol
-25: library StableMath {
-26:     using FixedPoint for uint256;
-27: 
-28:     uint256 internal constant _MIN_AMP = 1;
-29:     uint256 internal constant _MAX_AMP = 5000;
-30:     uint256 internal constant _AMP_PRECISION = 1e3;
-31: 
-32:     uint256 internal constant _MAX_STABLE_TOKENS = 5;
-```
-
-However, the Notional's leverage vault only supports up to a total of five (5) pool tokens. As a result, any composable pool with a total of 6 tokens is incompatible with the leverage vault.
-
-https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/common/SingleSidedLPVaultBase.sol#L40
-
-```solidity
-File: SingleSidedLPVaultBase.sol
-40:     uint256 internal constant MAX_TOKENS = 5;
-```
-
-https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/balancer/mixins/BalancerPoolMixin.sol#L89
-
-```solidity
-File: BalancerPoolMixin.sol
-75:     constructor(NotionalProxy notional_, DeploymentParams memory params)
-76:         SingleSidedLPVaultBase(notional_, params.tradingModule) {
-77: 
-78:         BALANCER_POOL_ID = params.balancerPoolId;
-79:         (address pool, /* */) = Deployments.BALANCER_VAULT.getPool(params.balancerPoolId);
-80:         BALANCER_POOL_TOKEN = IERC20(pool);
-81: 
-82:         // Fetch all the token addresses in the pool
-83:         (
-84:             address[] memory tokens,
-85:             /* uint256[] memory balances */,
-86:             /* uint256 lastChangeBlock */
-87:         ) = Deployments.BALANCER_VAULT.getPoolTokens(params.balancerPoolId);
-88: 
-89:         require(tokens.length <= MAX_TOKENS);
-90:         _NUM_TOKENS = uint8(tokens.length);
-91: 
-92:         TOKEN_1 = _NUM_TOKENS > 0 ? _rewriteWETH(tokens[0]) : address(0);
-93:         TOKEN_2 = _NUM_TOKENS > 1 ? _rewriteWETH(tokens[1]) : address(0);
-94:         TOKEN_3 = _NUM_TOKENS > 2 ? _rewriteWETH(tokens[2]) : address(0);
-95:         TOKEN_4 = _NUM_TOKENS > 3 ? _rewriteWETH(tokens[3]) : address(0);
-96:         TOKEN_5 = _NUM_TOKENS > 4 ? _rewriteWETH(tokens[4]) : address(0);
-```
-
-## Impact
-
-Notional is unable to deploy the new leverage vault for a Composable Pool that has 5 stable tokens, rendering the protocol useless for such types of pools.
-
-In addition, if the affected vaults cannot be used, it leads to a loss of revenue for the protocol.
-
-## Code Snippet
-
-https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/common/SingleSidedLPVaultBase.sol#L40
-
-https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/balancer/mixins/BalancerPoolMixin.sol#L89
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-Consider supporting up to a total of 6 pool tokens to ensure that all composable pools work with the leverage vault.
-
-```diff
-- uint256 internal constant MAX_TOKENS = 5;
-+ uint256 internal constant MAX_TOKENS = 6;
-```
-
-```diff
-require(tokens.length <= MAX_TOKENS);
-_NUM_TOKENS = uint8(tokens.length);
-
-TOKEN_1 = _NUM_TOKENS > 0 ? _rewriteWETH(tokens[0]) : address(0);
-TOKEN_2 = _NUM_TOKENS > 1 ? _rewriteWETH(tokens[1]) : address(0);
-TOKEN_3 = _NUM_TOKENS > 2 ? _rewriteWETH(tokens[2]) : address(0);
-TOKEN_4 = _NUM_TOKENS > 3 ? _rewriteWETH(tokens[3]) : address(0);
-TOKEN_5 = _NUM_TOKENS > 4 ? _rewriteWETH(tokens[4]) : address(0);
-+ TOKEN_6 = _NUM_TOKENS > 5 ? _rewriteWETH(tokens[5]) : address(0);
-
-DECIMALS_1 = _NUM_TOKENS > 0 ? TokenUtils.getDecimals(TOKEN_1) : 0;
-DECIMALS_2 = _NUM_TOKENS > 1 ? TokenUtils.getDecimals(TOKEN_2) : 0;
-DECIMALS_3 = _NUM_TOKENS > 2 ? TokenUtils.getDecimals(TOKEN_3) : 0;
-DECIMALS_4 = _NUM_TOKENS > 3 ? TokenUtils.getDecimals(TOKEN_4) : 0;
-DECIMALS_5 = _NUM_TOKENS > 4 ? TokenUtils.getDecimals(TOKEN_5) : 0;
-+ DECIMALS_6 = _NUM_TOKENS > 5 ? TokenUtils.getDecimals(TOKEN_6) : 0;
-```
-
-
-
-## Discussion
-
-**jeffywu**
-
-I think we will probably leave it at 5 including the BPT. I'm not sure whether to confirm or deny this report, it's technically accurate but we also won't really do anything about it.
-
-**nevillehuang**
-
-I think this is similar to #101 in the sense that I believe notional would definitely be interested in future composable stable pools that supports 6 tokens if it is potentially profitable for the protocol. 
-
-**jeffywu**
-
-I think that's debatable, the 5 tokens supports the current 4 stablecoin pool on Arbitrum. As the total number of tokens increases so does the gas cost of supporting such a pool and there's some upper bound where the economics are really too complex. It's a design decision where we put that limit and I do not think we will be adding another token.
-
-I also don't think it's likely the Balancer will support such pools. In practice, I believe it is more common to see a stablecoin plus the LP token of the 4Pool in a 2 token setup. This type of nested pool is not supported by our codebase but is something we may look into in the future.
-
-**nevillehuang**
-
-> I think that's debatable, the 5 tokens supports the current 4 stablecoin pool on Arbitrum. As the total number of tokens increases so does the gas cost of supporting such a pool and there's some upper bound where the economics are really too complex. It's a design decision where we put that limit and I do not think we will be adding another token.
-
-Since this falls under this section of sherlock [rules](https://docs.sherlock.xyz/audits/judging/judging#vii.-list-of-issue-categories-that-are-not-considered-valid) here, I am going to maintain medium since this issue and #101 was not explicitly mentioned in the docs/README as not intended, so I think it is fair that watsons bring these issues up even though it is implicitly implied, unless there is some information pointing to this.
-
-> 22. Future issues: Issues that result out of a future integration/implementation that was not intended (mentioned in the docs/README) or because of a future change in the code (as a fix to another issue) are not valid issues.
-
-# Issue M-7: Hardcode Chain ID 
-
-Source: https://github.com/sherlock-audit/2023-10-notional-judging/issues/73 
-
-## Found by 
-0xMaroutis, BAICE, ZanyBonzy, squeaky\_cactus, xiaoming90
-## Summary
-
-Leverage vault will not be able to deploy on Ethereum and Optimism due to hardcoded Chain ID.
-
-## Vulnerability Detail
-
-Per the contest's README, the contracts are intended to be deployed on Optimism sidechain and Ethereum Mainnet If a contract or protocol cannot be deployed on any of the mentioned chains in the README, it will be considered a valid issue in the context of this audit.
-
-https://github.com/sherlock-audit/2023-10-notional-xiaoming9090#q-on-what-chains-are-the-smart-contracts-going-to-be-deployed
-
-> **Q: On what chains are the smart contracts going to be deployed?**
->
-> Arbitrum, Mainnet, Optimism
-
-However, with the current implementation based on the in-scope codebase, the contracts will not be able to deploy due to the hardcoded chain ID of 42161 (Arbitrum) at Line 59. As a result, the deployment of existing in-scope contracts will revert and fail.
-
-https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/common/BaseStrategyVault.sol#L59
-
-```solidity
-File: BaseStrategyVault.sol
-18: abstract contract BaseStrategyVault is Initializable, IStrategyVault, AccessControlUpgradeable {
-..SNIP..
-57:     constructor(NotionalProxy notional_, ITradingModule tradingModule_) initializer {
-58:         // Make sure we are using the correct Deployments lib
-59:         uint256 chainId = 42161;
-60:         //assembly { chainId := chainid() }
-61:         require(Deployments.CHAIN_ID == chainId);
-62: 
-63:         NOTIONAL = notional_;
-64:         TRADING_MODULE = tradingModule_;
-65:     }
-```
-
-## Impact
-
-Leverage Vault will not be able to deploy on Ethereum and Optimism. In addition, if the affected vaults cannot be used, it leads to a loss of revenue for the protocol.
-
-## Code Snippet
-
-https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/common/BaseStrategyVault.sol#L59
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-Update the codebase to work with Optimism sidechain and Ethereum Mainnet
-
-
-
-## Discussion
-
-**jeffywu**
-
-This was commented on in Discord, the Deployments.sol file contains various chain id specific deployment constants. The hardcoding is used to check that the correct Deployments library is used per chain.
-
-**nevillehuang**
-
-> https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/common/BaseStrategyVault.sol#L59
-
-Hi @jeffywu in the contest READ.ME, it is said that the contracts will be supported on Arbitrum, mainnet and optimism, so I think it is fair that watsons bring this up as an issue, unless I am missing something since I don't see `BaseStrategyVault.sol` contracts with hardcoded chainIds specifically for mainnet and optimism. As such, I am inclined to keep medium severity.
-
-**jeffywu**
-
-Sounds good, your call.
-
-# Issue M-8: ETH can be sold during reinvestment 
+# Issue M-7: ETH can be sold during reinvestment 
 
 Source: https://github.com/sherlock-audit/2023-10-notional-judging/issues/74 
 
@@ -2100,7 +2315,7 @@ Valid report.
 
 https://github.com/notional-finance/leveraged-vaults/pull/67
 
-# Issue M-9: BPT LP Token could be sold off during re-investment 
+# Issue M-8: BPT LP Token could be sold off during re-investment 
 
 Source: https://github.com/sherlock-audit/2023-10-notional-judging/issues/76 
 
@@ -2206,7 +2421,7 @@ Valid issue.
 
 https://github.com/notional-finance/leveraged-vaults/pull/66
 
-# Issue M-10: Leverage Vault on sidechains that support Curve V2 pools is broken 
+# Issue M-9: Leverage Vault on sidechains that support Curve V2 pools is broken 
 
 Source: https://github.com/sherlock-audit/2023-10-notional-judging/issues/88 
 
@@ -2369,301 +2584,4 @@ It should be noted that none of the pools are available on Convex either:
 https://www.convexfinance.com/stake
 
 Furthermore, the Convex vault is only explicitly written for 2 token vaults, which the ones auditor listed are not. So therefore they could not be listed as structured Arbitrum in any case. I would range this as a medium severity, if anything.
-
-# Issue M-11: `SingleSidedLPVaultBase.emergencyExit` can be reverted by a front running withdrawal under certain conditions 
-
-Source: https://github.com/sherlock-audit/2023-10-notional-judging/issues/99 
-
-## Found by 
-squeaky\_cactus
-## Summary
-All the leveraged vaults share the same `emergencyExit` function, inherited from their ancestor `SingleSidedLPVaultBase`.
-
-When `SingleSidedLPVaultBase.emergencyExit` is called with the parameter `claimToExit` being the number of claims the vault holds, then a front running withdrawal transaction will cause the emergency exit to revert.
-
-
-## Vulnerability Detail
-When performing an emergency exit, the used parameter `claimToExit` is the amount of claims of the leveraged vault to unstake from the reward pool and exit from the LP pool.
-
-[SingleSidedLPVaultBase.emergencyExit](https://github.com/sherlock-audit/2023-10-notional/blob/7aadd254da5f645a7e1b718e7f9128f845e10f02/leveraged-vaults/contracts/vaults/common/SingleSidedLPVaultBase.sol#L480-L496)
-```solidity
-    function emergencyExit(
-        uint256 claimToExit, bytes calldata /* data */
-    ) external override onlyRole(EMERGENCY_EXIT_ROLE) {
-        StrategyVaultState memory state = VaultStorage.getStrategyVaultState();
-        if (claimToExit == 0) claimToExit = state.totalPoolClaim;
-
-        // By setting min amounts to zero, we will accept whatever tokens come from the pool
-        // in a proportional exit. Front running will not have an effect since no trading will
-        // occur during a proportional exit.
-        _unstakeAndExitPool(claimToExit, new uint256[](NUM_TOKENS()), true);
-
-        state.totalPoolClaim = state.totalPoolClaim - claimToExit;
-        state.setStrategyVaultState();
-
-        emit EmergencyExit(claimToExit);
-        _lockVault();
-    }
-```
-
-When `claimToExit` is greater than the claims the vault holds, then the transaction reverts during `_unstakeAndExitPool` call with `"ERC20: burn amount exceeds balance"` from the pool.
-
-### Steps
-Let us assume one user: Alice, who holds 5 shares.
-
-1. Emergency Exit tx created with `claimToExit` == `state.totalPoolClaim`
-2. Withdrawal `one share` tx created 
-3. Withdrawal tx is processed before Emergency Exit tx (front running)
-4. Vault holds one less share, and the corresponding amount less claims. 
-5. Emergency Exit tx is processed but reverts on `_unstakeAndExitPool`, as `claimToExit` is now greater than the vault's held claims.
-
-### Alternative cause
-To exit all funds, it most likely zero will be used as `claimToExit`, however is still a case where `state.totalPoolClaim` can be greater than the held claims, meaning you would legitimately pass in a non-zero value for `claimToExit`.
-
-Accounting problems with either the reward or LP pools (e.g. from an exploit), would result in the claims accounted in the leveraged vaults being no longer in sync with those held by the pools, meaning `claimToExit` would be the value held by the pools, not `state.totalPoolClaim`.
-
-
-
-### Proof of concept
-A test case demonstrating `claimToExit` as the reward pool balance for the vault, using the `Curve2TokenConvexVault.sol`.
-
-Place the following Solidity into the contract `Test_FRAX` in `FRAX_USDC_e.t.sol` and run with `forge test --match-contract Test_FRAX --match-test test_frontRunning_prevents_emergencyExit`
-```solidity
-    function test_frontRunning_prevents_emergencyExit() public {
-        // Deal to 'account' and deposit into the vault
-        address account = makeAddr("account");
-        uint256 maturity = maturities[0];
-        enterVaultBypass(account, maxDeposit, maturity, getDepositParams(0, 0));
-
-        // Grant 'exit' the emergency exit role
-        address exit = makeAddr("exit");
-        grantEmergencyExitRole(exit);
-
-        // Vault holdings of the reward pool
-        uint256 rewardPoolClaim = rewardPool.balanceOf(address(vault));
-        assertGt(0, rewardPoolClaim);
-
-        // Front running tx - withdraw; single share, no minimum price
-        exitVaultBypass(
-            account,
-            1,
-            maturity,
-            getRedeemParams(0, maturity)
-        );
-
-        // Emergency exit tx
-        vm.prank(exit);
-        v().emergencyExit(rewardPoolClaim, "");
-        // @audit - emergency exit reverts with "Reason: ERC20: burn amount exceeds balance"
-        // Cause being withdrawing more than balance from the Convex pool
-        // 0xF2afB340D1B50108Bd32212e867946B5B8044c23::withdraw(988296665078543581 [9.882e17], false) [delegatecall]
-    }
-
-    function grantEmergencyExitRole(address exit) private {
-        bytes32 role = v().EMERGENCY_EXIT_ROLE();
-        vm.prank(NOTIONAL.owner());
-        v().grantRole(role, exit);
-    }
-```
-
-
-## Impact
-Excerpt from the Discord channel [notional-update-4-nov-18](https://discord.com/channels/812037309376495636/1175450365395751023/1175781082336067655)
-
-> Jeff Wu | Notional — 11/19/2023 10:54 PM
->
-> Emergency exits are only intended to be executed during a security incident, not possible to really have a "verification" of such a thing on chain. 
-> I'd expect whoever is holding this role to be working in the best interests of protecting user funds. 
-> If they would be unable to fulfill that role then yes, I would say that is valid bug. 
-
-The emergency exit function is intended to withdraw funds from the both the reward and LP pools in case of a security incident, an example could be either the LP pool or reward pool being attacked / exploited.
-
-When the actor attempts to protect user funds by calling the emergency exit, they would believe there is a real risk for material loss of funds.
- i.e. emergency exit will not be called frivolously, but only in serious circumstances.
-
-A situation where emergency exit is prevented from being successfully executing, leaves the user funds exposed risk of loss, 
-which depending on the nature of the incident, could result in serious downside.
-
-The cost of executing the front running attack is a single fraction of a vault share and the elevated gas price, 
-and the attack is repeatable (keep funds at risk as long as necessary).
-
-
-## Code Snippet
-https://github.com/sherlock-audit/2023-10-notional/blob/7aadd254da5f645a7e1b718e7f9128f845e10f02/leveraged-vaults/contracts/vaults/common/SingleSidedLPVaultBase.sol#L489-L489
-
-
-## Tool used
-Manual Review, Forge tst
-
-
-## Recommendation
-`SingleSidedLPVaultBase.emergencyExit()` is only callable by a restricted role (who we may assume is acting in the best interest of the protocol).
-When the input `claimToExit` is greater than the current claim the vault holds (`state.totalPoolClaim`), 
-reducing the amount being claimed to the full amount of claims the vault holds will fulfill the intent of caller,
-as best can be achieved in an emergency situation.
-
-Update in [SingleSidedLPVaultBase.emergencyExit](https://github.com/sherlock-audit/2023-10-notional/blob/7aadd254da5f645a7e1b718e7f9128f845e10f02/leveraged-vaults/contracts/vaults/common/SingleSidedLPVaultBase.sol#L480-L496)
-```diff
-    function emergencyExit(
-        uint256 claimToExit, bytes calldata /* data */
-    ) external override onlyRole(EMERGENCY_EXIT_ROLE) {
-        StrategyVaultState memory state = VaultStorage.getStrategyVaultState();
--        if (claimToExit == 0) claimToExit = state.totalPoolClaim;
-+        if (claimToExit == 0 || claimToExit > state.totalPoolClaim) claimToExit = state.totalPoolClaim;
-
-        // By setting min amounts to zero, we will accept whatever tokens come from the pool
-        // in a proportional exit. Front running will not have an effect since no trading will
-        // occur during a proportional exit.
-        _unstakeAndExitPool(claimToExit, new uint256[](NUM_TOKENS()), true);
-
-        state.totalPoolClaim = state.totalPoolClaim - claimToExit;
-        state.setStrategyVaultState();
-
-        emit EmergencyExit(claimToExit);
-        _lockVault();
-    }
-```
-
-
-
-## Discussion
-
-**jeffywu**
-
-Agree this is a pragmatic change, not sure about the severity here.
-
-**jeffywu**
-
-https://github.com/notional-finance/leveraged-vaults/pull/65
-
-**T-Woodward**
-
-I don't fully understand this. So the auditor is saying that the Balancer pool's accounting may be wrong, which would lead the emergency exit role to call the emergency exit function with a claimToExit value that is greater than state.totalPoolClaim? And in this case, the call would fail?
-
-It seems like the auditor is suggesting that it could be possible that broken accounting on the pool would necessitate inputting a specific claimToExit value in order to withdraw all the BPTs instead of inputting 0. 
-
-> To exit all funds, it most likely zero will be used as claimToExit, however is still a case where state.totalPoolClaim can be greater than the held claims, meaning you would legitimately pass in a non-zero value for claimToExit.
-
-But then the auditor's recommendation is to add a condition whereby claimToExit is eventually set to the same value as if a zero-value were passed in. This contradicts my impression of what the auditor is suggesting is the problem here.
-
-Additionally - if the accounting really is broken on the Balancer pool, isn't it possible that we would need to set claimToExit greater than state.totalPoolClaim in order to get all our BPTs back?
-
-# Issue M-12: `TokenUtils.getDecimals()` is not supporting tokens with more than 18 decimals 
-
-Source: https://github.com/sherlock-audit/2023-10-notional-judging/issues/101 
-
-## Found by 
-lemonmon
-## Summary
-
-`TokenUtils.getDecimals()` is not supporting tokens with decimals bigger than 18. Whenever this function gets called with a token that has more than 18 decimals, there will be a revert triggered. Thus, certain vaults can't be created with tokens that have more than 18 decimals.
-
-## Vulnerability Detail
-
-Whenever `TokenUtils.getDecimals()` is used with a token that has more than 18 decimals a revert will be triggered on line 14 in TokenUtils.sol.
-
-According to the [contest page](https://audits.sherlock.xyz/contests/119) any ERC20 tokens should be supported.
-
-> Which ERC20 tokens do you expect will interact with the smart contracts? <br>
-> any
-
-`TokenUtils.getDecimals()` is used by:
-
-- `CrossCurrencyVault.initialize()` to set up `LEND_DECIMALS` and `BORROW_DECIMALS` (line 86-87 CrossCurrencyVault.sol) for the lend and borrow tokens.
-- `BalancerComposableAuraVault` and `BalancerWeightedAuraVault` constructors to set up the decimals for the tokens (line 98-102 BalancerPoolMixin.sol)
-
-
-## Impact
-
-The Notional protocol is not compatible with tokens that have more than 18 decimals. Vaults like the `CrossCurrencyVault`, `BalancerComposableAuraVault`, `BalancerWeightedAuraVault` don't support tokens with more than 18 decimals as shown in the details above.
-
-## Code Snippet
-
-https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/utils/TokenUtils.sol#L11-L14
-
-https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/balancer/mixins/BalancerPoolMixin.sol#L98-L102
-
-https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/CrossCurrencyVault.sol#L86-L87
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-Since any ERC20 tokens are supposed to be supported, consider supporting tokens with more than 18 decimals by adjusting the `TokenUtils.getDecimals()` function to not revert when a token has more than 18 decimals.
-
-
-
-## Discussion
-
-**jeffywu**
-
-This is by design and furthermore, I do not believe there are any tokens with more than 18 decimals worth listing.
-
-**nevillehuang**
-
-> This is by design and furthermore, I do not believe there are any tokens with more than 18 decimals worth listing.
-
-I think I will maintain medium severity since in the contest details it is stated that any tokens are deemed to be supported, and I believe notional will definitely be interested if in the future if there is any tokens more than 18 decimals worth listing.
-
-**nevillehuang**
-
-See additional comment [here](https://github.com/sherlock-audit/2023-10-notional-judging/issues/70#issuecomment-1836843782).
-
-# Issue M-13: Approve to zero not used for lendunderlyingtokens, will affect tokens like USDT 
-
-Source: https://github.com/sherlock-audit/2023-10-notional-judging/issues/102 
-
-## Found by 
-Jaraxxus, ZanyBonzy, bitsurfer
-## Summary
-
-If lendUnderlyingTokens is USDT, then `_depositFromNotional()` will not work.
-
-## Vulnerability Detail
-
-The vault borow in one currency and trades it into a different currency. Some ERC20 tokens like USDT require resetting the approval to 0 first before being able to reset it to another value.  If the lend token is USDT, then must approve to zero first.
-
-```solidity
-            if (isETH) {
-                WETH.deposit{value: lendUnderlyingTokens}();
-                IERC20(address(WETH)).approve(address(wfCash), lendUnderlyingTokens);
-            } else {
->               lendToken.approve(address(wfCash), lendUnderlyingTokens); 
-            }
-            vaultShares = wfCash.deposit(lendUnderlyingTokens, address(this));
-        }
-```
-
-
-## Impact
-
-Unsafe ERC20 approve that do not handle non-standard erc20 behavior. 1.Some token contracts do not return any value. 2.Some token contracts revert the transaction when the allowance is not zero.
-
-## Code Snippet
-
-https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/vaults/CrossCurrencyVault.sol
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-Set the allowance to zero first before increasing the allowance, like how its done in TokenUtils `checkApprove()`
-
-https://github.com/sherlock-audit/2023-10-notional/blob/main/leveraged-vaults/contracts/utils/TokenUtils.sol#L24
-
-
-
-## Discussion
-
-**jeffywu**
-
-Acknowledged
-
-**jeffywu**
-
-https://github.com/notional-finance/leveraged-vaults/pull/64
 
